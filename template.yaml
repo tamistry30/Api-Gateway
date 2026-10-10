@@ -1,0 +1,87 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Claude gateway - API Gateway (API key auth + usage plan) -> Lambda -> Bedrock, with usage logging
+
+Parameters:
+  ModelId:
+    Type: String
+    Default: anthropic.claude-opus-5-5
+    Description: Bedrock model ID (e.g. anthropic.claude-haiku-5-5 for cheaper testing)
+  RatePerSecond:
+    Type: Number
+    Default: 2
+  BurstLimit:
+    Type: Number
+    Default: 5
+  DailyQuota:
+    Type: Number
+    Default: 100
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 60
+    MemorySize: 256
+
+Resources:
+  UsageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: api_key_id, AttributeType: S }
+        - { AttributeName: request_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: api_key_id, KeyType: HASH }
+        - { AttributeName: request_id, KeyType: RANGE }
+
+  GatewayApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Auth:
+        ApiKeyRequired: true
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          Description: Default plan - throttle and daily quota per key
+          Throttle:
+            RateLimit: !Ref RatePerSecond
+            BurstLimit: !Ref BurstLimit
+          Quota:
+            Limit: !Ref DailyQuota
+            Period: DAY
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          LoggingLevel: "OFF"
+
+  ChatFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.handler
+      Environment:
+        Variables:
+          MODEL_ID: !Ref ModelId
+          USAGE_TABLE: !Ref UsageTable
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref UsageTable
+        - Statement:
+            - Effect: Allow
+              Action: bedrock-mantle:CreateInference
+              Resource: "*" # tighten to your model ARNs once it works
+      Events:
+        Chat:
+          Type: Api
+          Properties:
+            RestApiId: !Ref GatewayApi
+            Path: /chat
+            Method: post
+
+Outputs:
+  ChatUrl:
+    Value: !Sub "https://${GatewayApi}.execute-api.${AWS::Region}.amazonaws.com/prod/chat"
+  UsageTable:
+    Value: !Ref UsageTable
